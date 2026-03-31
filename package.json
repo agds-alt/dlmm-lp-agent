@@ -1,0 +1,41 @@
+{
+  "name": "dlmm-lp-agent",
+  "version": "0.1.0",
+  "description": "Automated LP Agent for Meteora DLMM on Solana - Quick flip strategy for new token launches",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "ts-node tests/paper.trading.ts",
+    "test:scanner": "ts-node tests/test.scanner.ts",
+    "scanner": "ts-node src/scanner/index.ts",
+    "backtest": "ts-node scripts/backtest.ts"
+  },
+  "keywords": [
+    "solana",
+    "meteora",
+    "dlmm",
+    "liquidity-provider",
+    "defi",
+    "trading-bot"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.0",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.0",
+    "node-telegram-bot-api": "^0.64.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/bn.js": "^5.1.5",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.2"
+  }
+}
