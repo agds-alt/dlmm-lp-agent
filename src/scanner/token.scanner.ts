@@ -7,6 +7,8 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { SafetyChecker, SafetyCheckResult } from './safety.checker';
 import { VolumeAnalyzer, VolumeMetrics } from './volume.analyzer';
 import { MetadataFetcher, TokenMetadata } from './metadata.fetcher';
+import { PriceAnalyzer, PriceMetrics } from './price.analyzer';
+import { SmartSignalsAnalyzer, SmartSignals } from './smart.signals';
 import { logger } from '../utils/logger';
 
 export interface TokenCandidate {
@@ -16,6 +18,8 @@ export interface TokenCandidate {
   metadata: TokenMetadata;
   safetyCheck: SafetyCheckResult;
   volumeMetrics?: VolumeMetrics;
+  priceMetrics?: PriceMetrics;
+  smartSignals?: SmartSignals;
   age: number;
   score: number;
   tier: number;
@@ -27,18 +31,29 @@ export class TokenScanner {
   private safetyChecker: SafetyChecker;
   private volumeAnalyzer: VolumeAnalyzer;
   private metadataFetcher: MetadataFetcher;
+  private priceAnalyzer: PriceAnalyzer;
+  private smartSignalsAnalyzer: SmartSignalsAnalyzer;
 
   constructor(connection: Connection) {
     this.connection = connection;
     this.safetyChecker = new SafetyChecker(connection);
     this.volumeAnalyzer = new VolumeAnalyzer(connection);
     this.metadataFetcher = new MetadataFetcher(connection);
+    this.priceAnalyzer = new PriceAnalyzer(connection);
+    this.smartSignalsAnalyzer = new SmartSignalsAnalyzer(connection);
   }
 
   /**
-   * Scan and evaluate a single token (with optional Tier 2 analysis)
+   * Scan and evaluate a single token (with configurable tier analysis)
    */
-  async scanToken(mintAddress: string, includeTier2: boolean = false): Promise<TokenCandidate | null> {
+  async scanToken(
+    mintAddress: string,
+    options: {
+      includeTier2?: boolean;
+      includeTier3?: boolean;
+      includeTier4?: boolean;
+    } = {}
+  ): Promise<TokenCandidate | null> {
     try {
       logger.info(`Scanning token: ${mintAddress}`);
 
@@ -59,22 +74,52 @@ export class TokenScanner {
       if (!ageCheck.passed) {
         logger.warn(`Token ${metadata.symbol} age check failed: ${ageCheck.message}`);
         // Don't return null - age check might fail for established tokens
-        // Just log the warning
       }
 
-      // Tier 2: Volume & liquidity analysis (optional)
+      // Tier 2: Volume & liquidity analysis
       let volumeMetrics: VolumeMetrics | undefined;
-      if (includeTier2) {
+      if (options.includeTier2) {
         volumeMetrics = await this.volumeAnalyzer.analyze(mintAddress);
 
         if (!volumeMetrics.passed) {
           logger.warn(`Token ${metadata.symbol} failed Tier 2 volume checks`);
-          // Don't return null yet - still include in candidates but mark as risky
         }
       }
 
-      // Calculate combined score
-      const combinedScore = this.calculateCombinedScore(safetyCheck, volumeMetrics);
+      // Tier 3: Price action analysis
+      let priceMetrics: PriceMetrics | undefined;
+      if (options.includeTier3) {
+        priceMetrics = await this.priceAnalyzer.analyze(mintAddress);
+
+        if (!priceMetrics.passed) {
+          logger.warn(`Token ${metadata.symbol} failed Tier 3 price checks`);
+        }
+      }
+
+      // Tier 4: Smart money signals
+      let smartSignals: SmartSignals | undefined;
+      if (options.includeTier4) {
+        smartSignals = await this.smartSignalsAnalyzer.analyze(mintAddress);
+
+        if (!smartSignals.passed) {
+          logger.warn(`Token ${metadata.symbol} failed Tier 4 smart signals`);
+        }
+      }
+
+      // Calculate combined score from all tiers
+      const combinedScore = this.calculateCombinedScore(
+        safetyCheck,
+        volumeMetrics,
+        priceMetrics,
+        smartSignals
+      );
+
+      // Determine if recommended based on all criteria
+      const allTiersPassed =
+        safetyCheck.passed &&
+        (!volumeMetrics || volumeMetrics.passed) &&
+        (!priceMetrics || priceMetrics.passed) &&
+        (!smartSignals || smartSignals.passed);
 
       // Create candidate object
       const candidate: TokenCandidate = {
@@ -84,10 +129,12 @@ export class TokenScanner {
         metadata,
         safetyCheck,
         volumeMetrics,
+        priceMetrics,
+        smartSignals,
         age: ageCheck.age,
         score: combinedScore,
         tier: this.determineCombinedTier(combinedScore),
-        recommended: combinedScore >= 75 && safetyCheck.passed && (!volumeMetrics || volumeMetrics.passed),
+        recommended: combinedScore >= 75 && allTiersPassed,
       };
 
       logger.success(`Token ${metadata.symbol} scanned - Score: ${candidate.score}/100 (Tier ${candidate.tier})`);
@@ -101,18 +148,53 @@ export class TokenScanner {
 
   /**
    * Calculate combined score from all tiers
+   * Weights:
+   * - Tier 1 (Safety): 40% (most critical)
+   * - Tier 2 (Volume): 25%
+   * - Tier 3 (Price): 20%
+   * - Tier 4 (Smart Signals): 15%
    */
   private calculateCombinedScore(
     safetyCheck: SafetyCheckResult,
-    volumeMetrics?: VolumeMetrics
+    volumeMetrics?: VolumeMetrics,
+    priceMetrics?: PriceMetrics,
+    smartSignals?: SmartSignals
   ): number {
-    // Tier 1 (Safety): 60% weight
-    const tier1Score = safetyCheck.score * 0.6;
+    let totalWeight = 0;
+    let weightedScore = 0;
 
-    // Tier 2 (Volume): 40% weight
-    const tier2Score = volumeMetrics ? volumeMetrics.score * 0.4 : 0;
+    // Tier 1 (Safety): 40% weight - ALWAYS included
+    const tier1Weight = 0.4;
+    weightedScore += safetyCheck.score * tier1Weight;
+    totalWeight += tier1Weight;
 
-    return Math.round(tier1Score + tier2Score);
+    // Tier 2 (Volume): 25% weight
+    if (volumeMetrics) {
+      const tier2Weight = 0.25;
+      weightedScore += volumeMetrics.score * tier2Weight;
+      totalWeight += tier2Weight;
+    }
+
+    // Tier 3 (Price): 20% weight
+    if (priceMetrics) {
+      const tier3Weight = 0.2;
+      weightedScore += priceMetrics.score * tier3Weight;
+      totalWeight += tier3Weight;
+    }
+
+    // Tier 4 (Smart Signals): 15% weight
+    if (smartSignals) {
+      const tier4Weight = 0.15;
+      weightedScore += smartSignals.score * tier4Weight;
+      totalWeight += tier4Weight;
+    }
+
+    // Normalize if not all tiers included
+    if (totalWeight < 1) {
+      weightedScore = (weightedScore / totalWeight);
+    }
+
+    return Math.round(weightedScore);
   }
 
   /**
@@ -128,13 +210,20 @@ export class TokenScanner {
   /**
    * Scan multiple tokens
    */
-  async scanTokens(mintAddresses: string[], includeTier2: boolean = false): Promise<TokenCandidate[]> {
+  async scanTokens(
+    mintAddresses: string[],
+    options: {
+      includeTier2?: boolean;
+      includeTier3?: boolean;
+      includeTier4?: boolean;
+    } = {}
+  ): Promise<TokenCandidate[]> {
     logger.info(`Scanning ${mintAddresses.length} tokens...`);
 
     const candidates: TokenCandidate[] = [];
 
     for (const mintAddress of mintAddresses) {
-      const candidate = await this.scanToken(mintAddress, includeTier2);
+      const candidate = await this.scanToken(mintAddress, options);
       if (candidate) {
         candidates.push(candidate);
       }
@@ -180,25 +269,60 @@ export class TokenScanner {
       candidate.safetyCheck.warnings.forEach(w => console.log(`  ⚠️  ${w}`));
     }
 
-    if (candidate.safetyCheck.errors.length > 0) {
-      console.log('\nTier 1 Errors:');
-      candidate.safetyCheck.errors.forEach(e => console.log(`  ❌ ${e}`));
-    }
-
     // Show Tier 2 volume metrics if available
     if (candidate.volumeMetrics) {
       console.log('\n--- TIER 2: VOLUME & LIQUIDITY ---');
       console.log(`Score: ${candidate.volumeMetrics.score}/100`);
       console.log(`Status: ${candidate.volumeMetrics.passed ? '✅ PASSED' : '❌ FAILED'}`);
-      console.log(`\n  Volume 24h: $${candidate.volumeMetrics.volume24h.toLocaleString()}`);
+      console.log(`  Volume 24h: $${candidate.volumeMetrics.volume24h.toLocaleString()}`);
       console.log(`  Liquidity: $${candidate.volumeMetrics.liquidity.toLocaleString()}`);
       console.log(`  Unique Traders: ${candidate.volumeMetrics.uniqueTraders24h}`);
       console.log(`  Buy/Sell Ratio: ${candidate.volumeMetrics.buySellRatio.toFixed(2)}`);
       console.log(`  Liq/Vol Ratio: ${candidate.volumeMetrics.liquidityVolumeRatio.toFixed(1)}%`);
 
       if (candidate.volumeMetrics.warnings.length > 0) {
-        console.log('\nTier 2 Warnings:');
+        console.log('\nWarnings:');
         candidate.volumeMetrics.warnings.forEach(w => console.log(`  ⚠️  ${w}`));
+      }
+    }
+
+    // Show Tier 3 price metrics if available
+    if (candidate.priceMetrics) {
+      console.log('\n--- TIER 3: PRICE ACTION ---');
+      console.log(`Score: ${candidate.priceMetrics.score}/100`);
+      console.log(`Status: ${candidate.priceMetrics.passed ? '✅ PASSED' : '❌ FAILED'}`);
+      console.log(`  Current Price: $${candidate.priceMetrics.currentPrice.toFixed(8)}`);
+      console.log(`  24h Change: ${candidate.priceMetrics.priceChange24h >= 0 ? '+' : ''}${candidate.priceMetrics.priceChange24h.toFixed(2)}%`);
+      console.log(`  7d Change: ${candidate.priceMetrics.priceChange7d >= 0 ? '+' : ''}${candidate.priceMetrics.priceChange7d.toFixed(2)}%`);
+      console.log(`  Volatility (7d): ${candidate.priceMetrics.volatility7d.toFixed(1)}%`);
+      console.log(`  Trend: ${candidate.priceMetrics.trendDirection.toUpperCase()}`);
+      console.log(`  Range-bound: ${candidate.priceMetrics.isRangeBound ? 'YES ✓' : 'NO'}`);
+
+      if (candidate.priceMetrics.warnings.length > 0) {
+        console.log('\nWarnings:');
+        candidate.priceMetrics.warnings.forEach(w => console.log(`  ⚠️  ${w}`));
+      }
+    }
+
+    // Show Tier 4 smart signals if available
+    if (candidate.smartSignals) {
+      console.log('\n--- TIER 4: SMART MONEY SIGNALS ---');
+      console.log(`Score: ${candidate.smartSignals.score}/100`);
+      console.log(`Status: ${candidate.smartSignals.passed ? '✅ PASSED' : '❌ FAILED'}`);
+      console.log(`  Jupiter Listed: ${candidate.smartSignals.isListedJupiter ? 'YES ✓' : 'NO'}`);
+      console.log(`  Trending: ${candidate.smartSignals.isTrending ? 'YES ✓' : 'NO'}`);
+      console.log(`  Trending Score: ${candidate.smartSignals.trendingScore}/100`);
+      console.log(`  Recent Listing: ${candidate.smartSignals.hasRecentListing ? 'YES ✓' : 'NO'}`);
+      console.log(`  24h Transactions: ${candidate.smartSignals.txCount24h}`);
+
+      if (candidate.smartSignals.signals.length > 0) {
+        console.log('\nPositive Signals:');
+        candidate.smartSignals.signals.forEach(s => console.log(`  ✨ ${s}`));
+      }
+
+      if (candidate.smartSignals.warnings.length > 0) {
+        console.log('\nWarnings:');
+        candidate.smartSignals.warnings.forEach(w => console.log(`  ⚠️  ${w}`));
       }
     }
 
