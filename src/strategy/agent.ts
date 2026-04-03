@@ -26,6 +26,9 @@ import { DLMMPoolReader } from '../core/dlmm.pool';
 import { TokenScanner } from '../scanner/token.scanner';
 import { PositionManager, Position } from './position.manager';
 import { Rebalancer } from './rebalancer';
+import * as db from '../database/position.db';
+import * as telegram from '../notifications/telegram.alert';
+import { PoolDiscovery } from '../scanner/pool.discovery';
 
 export interface AgentStatus {
   running: boolean;
@@ -49,6 +52,7 @@ export class DLMMAgent {
   private scanner: TokenScanner;
   private positionManager: PositionManager;
   private rebalancer: Rebalancer;
+  private discovery: PoolDiscovery;
 
   private running = false;
   private startTime = 0;
@@ -77,6 +81,7 @@ export class DLMMAgent {
     this.scanner = new TokenScanner(this.connection);
     this.positionManager = new PositionManager(this.connection, this.wallet);
     this.rebalancer = new Rebalancer(this.connection, this.poolReader, this.positionManager);
+    this.discovery = new PoolDiscovery(this.connection);
   }
 
   /**
@@ -100,6 +105,10 @@ export class DLMMAgent {
     logger.info(`  Target: +${STRATEGY_CONFIG.TARGET_DAILY_GAIN}%/day`);
     logger.info(`  Risk: -${STRATEGY_CONFIG.MAX_LOSS_PERCENT}% max loss, -${STRATEGY_CONFIG.MAX_IL_PERCENT}% max IL`);
     logger.info('='.repeat(50));
+
+    await telegram.sendAlert(
+      `🤖 <b>DLMM LP Agent Started</b>\nMode: ${mode}\nCapital: $${STRATEGY_CONFIG.STARTING_CAPITAL}\nMax Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}`,
+    );
 
     // Main loop
     while (this.running) {
@@ -136,7 +145,9 @@ export class DLMMAgent {
     const alerts = this.positionManager.checkRiskLimits();
     for (const alert of alerts) {
       logger.warn(`RISK ALERT: ${alert.reason}`);
-      await this.positionManager.closePosition(alert.positionId);
+      await telegram.notifyRiskAlert(alert.positionId, alert.reason);
+      const closed = await this.positionManager.closePosition(alert.positionId);
+      if (closed) await telegram.notifyPositionClosed(closed);
     }
 
     // 3. Rebalance existing positions
@@ -152,7 +163,10 @@ export class DLMMAgent {
       await this.scanAndEnter(STRATEGY_CONFIG.MAX_POSITIONS - currentOpen);
     }
 
-    // 5. Print status
+    // 5. Persist positions
+    db.savePositions(this.positionManager.getAllPositions());
+
+    // 6. Print status
     this.printStatus();
   }
 
@@ -164,39 +178,26 @@ export class DLMMAgent {
     this.lastScanTime = Date.now();
 
     try {
-      // Use scanner to find top candidates
-      // For now, use a predefined watchlist of popular DLMM tokens
-      const watchlist = [
-        'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', // WIF
-        'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK
-        '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', // POPCAT
-      ];
+      // Auto-discover trending tokens with DLMM pools
+      const candidates = await this.discovery.discoverCandidates(maxNew * 3);
+      logger.info(`Found ${candidates.length} candidates from auto-discovery`);
 
-      for (const tokenMint of watchlist) {
+      for (const candidate of candidates) {
         if (maxNew <= 0) break;
 
-        // Scan token
-        const result = await this.scanner.scanToken(tokenMint);
-        if (!result || result.score < 75) {
-          logger.info(`Token ${tokenMint.slice(0, 8)}... score ${result?.score || 0} - skipped`);
-          continue;
-        }
+        // Skip if we already have a position in this pool
+        const existing = this.positionManager.getOpenPositions()
+          .find(p => p.poolAddress === candidate.poolAddress);
+        if (existing) continue;
 
-        // Find DLMM pool
-        const pools = await this.poolReader.findPools(tokenMint, this.SOL_MINT);
-        if (pools.length === 0) {
-          logger.info(`No DLMM pool found for ${tokenMint.slice(0, 8)}...`);
-          continue;
-        }
-
-        // Analyze best pool
-        const analysis = await this.poolReader.analyzePool(pools[0]);
+        // Analyze pool
+        const analysis = await this.poolReader.analyzePool(candidate.poolAddress);
         if (!analysis) continue;
 
         // Open position
         const positionSize = POSITION_CONFIG.POSITION_SIZE;
         const position = await this.positionManager.openPosition(
-          pools[0],
+          candidate.poolAddress,
           positionSize,
           analysis.suggestedRange.min,
           analysis.suggestedRange.max,
@@ -204,7 +205,8 @@ export class DLMMAgent {
 
         if (position) {
           maxNew--;
-          logger.info(`Entered position: $${positionSize} in ${pools[0].slice(0, 8)}...`);
+          await telegram.notifyPositionOpened(position);
+          logger.info(`Entered: $${positionSize} in ${candidate.poolAddress.slice(0, 8)}... (score: ${candidate.score})`);
         }
       }
     } catch (error) {
