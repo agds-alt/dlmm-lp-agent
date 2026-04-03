@@ -145,32 +145,34 @@ export class PoolDiscovery {
    */
   private async fetchTrendingPairs(): Promise<DexScreenerPair[]> {
     try {
-      // Primary: boosted tokens (trending/promoted)
-      const boostResp = await axios.get<DexScreenerPair[]>(
-        `${DEXSCREENER_API}/token-boosts/top/v1`,
-        { timeout: 15_000 },
-      );
+      // Search for Meteora pairs directly - these have volume/age data
+      const keywords = ['meteora', 'SOL meme', 'solana new'];
+      let allPairs: DexScreenerPair[] = [];
 
-      let pairs: DexScreenerPair[] = Array.isArray(boostResp.data) ? boostResp.data : [];
-
-      // Filter to Solana only
-      pairs = pairs.filter(p => p.chainId === 'solana');
-
-      if (pairs.length > 0) {
-        return pairs;
+      for (const q of keywords) {
+        try {
+          const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
+            `${DEXSCREENER_API}/latest/dex/search`,
+            { params: { q }, timeout: 15_000 },
+          );
+          const pairs = (resp.data?.pairs ?? []).filter(
+            (p: DexScreenerPair) => p.chainId === 'solana' && p.dexId?.includes('meteora'),
+          );
+          allPairs.push(...pairs);
+        } catch {
+          // Skip failed queries
+        }
       }
 
-      // Fallback: search Solana pairs sorted by volume
-      logger.debug('[PoolDiscovery] Boost endpoint empty, falling back to search');
-      const searchResp = await axios.get<{ pairs: DexScreenerPair[] }>(
-        `${DEXSCREENER_API}/latest/dex/search`,
-        {
-          params: { q: 'SOL' },
-          timeout: 15_000,
-        },
-      );
+      // Deduplicate by pairAddress
+      const seen = new Set<string>();
+      allPairs = allPairs.filter(p => {
+        if (seen.has(p.pairAddress)) return false;
+        seen.add(p.pairAddress);
+        return true;
+      });
 
-      return (searchResp.data?.pairs ?? []).filter(p => p.chainId === 'solana');
+      return allPairs;
     } catch (error) {
       logger.error('[PoolDiscovery] Failed to fetch trending pairs', error);
       return [];
