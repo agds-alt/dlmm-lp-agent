@@ -1,6 +1,6 @@
 [
   {
-    "id": "pos_1775195049975_h0nzgq",
+    "id": "pos_1775195222792_vymnst",
     "poolAddress": "8QjxUhHUBJJvHn3GCAqZqoevNZkr7D641JBRLFwqnhNk",
     "tokenX": "82MmG1uH2BWLyoU7VCFYMohP9CT63q5paiKHAAAn3zWx",
     "tokenY": "So11111111111111111111111111111111111111112",
@@ -9,7 +9,7 @@
       "max": -589
     },
     "entryPrice": 0.00000879921495082409,
-    "entryTime": 1775195049975,
+    "entryTime": 1775195222792,
     "amountX": 947054.183799985,
     "amountY": 8.333333333333334,
     "totalValueUsd": 16.666666666666668,
@@ -18,12 +18,12 @@
     "pnl": 0,
     "pnlPercent": 0,
     "ilPercent": 0,
-    "feesEarned": 0,
+    "feesEarned": 0.000018455627431084053,
     "status": "open",
     "isPaper": true
   },
   {
-    "id": "pos_1775195051550_hbv3vi",
+    "id": "pos_1775195226805_ba3r9s",
     "poolAddress": "6b56mFU6GPopawa6hHtkpf5KYKGWPgGUuGNytCMvcZEp",
     "tokenX": "Bb4jR951QtVjeFAYFLBYXDSMKjbTDroCLPbFLdd7pump",
     "tokenY": "So11111111111111111111111111111111111111112",
@@ -32,7 +32,7 @@
       "max": -171
     },
     "entryPrice": 0.00011515013506717148,
-    "entryTime": 1775195051550,
+    "entryTime": 1775195226805,
     "amountX": 72369.28839442683,
     "amountY": 8.333333333333334,
     "totalValueUsd": 16.666666666666668,
@@ -41,12 +41,12 @@
     "pnl": 0,
     "pnlPercent": 0,
     "ilPercent": 0,
-    "feesEarned": 0,
+    "feesEarned": 0.000018472539320142062,
     "status": "open",
     "isPaper": true
   },
   {
-    "id": "pos_1775195061841_0f3l9s",
+    "id": "pos_1775195230525_4wwip5",
     "poolAddress": "BrdkY6XrdWLMMwTUdXTfebtK3fZNUT8QudohNHhzCofK",
     "tokenX": "3TYgKwkE2Y3rxdw9osLRSpxpXmSC1C1oo19W9KHspump",
     "tokenY": "So11111111111111111111111111111111111111112",
@@ -55,7 +55,7 @@
       "max": -200
     },
     "entryPrice": 0.000018313244937921883,
-    "entryTime": 1775195061841,
+    "entryTime": 1775195230525,
     "amountX": 455044.0602734039,
     "amountY": 8.333333333333334,
     "totalValueUsd": 16.666666666666668,
@@ -64,7 +64,7 @@
     "pnl": 0,
     "pnlPercent": 0,
     "ilPercent": 0,
-    "feesEarned": 0,
+    "feesEarned": 0.000018698207339759853,
     "status": "open",
     "isPaper": true
   }

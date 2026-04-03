@@ -1,0 +1,17 @@
+[Unit]
+Description=DLMM LP Agent - Meteora Liquidity Provider
+After=network.target
+
+[Service]
+Type=simple
+User=dracarys
+WorkingDirectory=/home/dracarys/projects/dlmm-lp-agent
+ExecStart=/usr/bin/npx ts-node src/index.ts
+Restart=on-failure
+RestartSec=30
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
