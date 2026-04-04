@@ -28,7 +28,9 @@ import { PositionManager, Position } from './position.manager';
 import { Rebalancer } from './rebalancer';
 import * as db from '../database/position.db';
 import * as telegram from '../notifications/telegram.alert';
-import { PoolDiscovery } from '../scanner/pool.discovery';
+import { registerCommandHandlers, startCommandPolling, stopCommandPolling } from '../notifications/telegram.alert';
+import { PoolDiscovery, DiscoveredCandidate } from '../scanner/pool.discovery';
+import { scanHighVolume, shouldAlert, markAlerted, formatTokenAlert } from '../scanner/volume.scanner';
 
 export interface AgentStatus {
   running: boolean;
@@ -59,6 +61,9 @@ export class DLMMAgent {
   private cyclesCompleted = 0;
   private lastScanTime = 0;
   private lastRebalanceTime = 0;
+
+  // Track re-entries per token mint address: { mint -> entryCount }
+  private tokenEntryCount: Map<string, number> = new Map();
 
   // SOL mint for pairing
   private readonly SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -107,8 +112,17 @@ export class DLMMAgent {
     logger.info('='.repeat(50));
 
     await telegram.sendAlert(
-      `🤖 <b>DLMM LP Agent Started</b>\nMode: ${mode}\nCapital: $${STRATEGY_CONFIG.STARTING_CAPITAL}\nMax Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}`,
+      `🤖 <b>DLMM LP Agent Started</b>\nMode: ${mode}\nCapital: $${STRATEGY_CONFIG.STARTING_CAPITAL}\nMax Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}\nTarget: +${STRATEGY_CONFIG.PROFIT_TARGET_PERCENT}%\nMax Re-entry: ${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN}x per token`,
     );
+
+    // Start Telegram command listener with scan & entry providers
+    registerCommandHandlers(
+      () => this.getStatus(),
+      () => this.positionManager.getOpenPositions(),
+      () => this.scanCandidatesForTelegram(),
+      (poolAddress, mintAddress, symbol) => this.enterFromTelegram(poolAddress, mintAddress, symbol),
+    );
+    startCommandPolling();
 
     // Main loop
     while (this.running) {
@@ -141,7 +155,19 @@ export class DLMMAgent {
       await this.positionManager.updatePosition(pos.id);
     }
 
-    // 2. Check risk limits
+    // 2. Check profit target - auto-exit when hit
+    for (const pos of this.positionManager.getOpenPositions()) {
+      if (pos.pnlPercent >= STRATEGY_CONFIG.PROFIT_TARGET_PERCENT) {
+        logger.info(`TARGET HIT: ${pos.id} at +${pos.pnlPercent.toFixed(2)}% (target: ${STRATEGY_CONFIG.PROFIT_TARGET_PERCENT}%)`);
+        await telegram.sendAlert(
+          `🎯 <b>TARGET HIT!</b>\nPosition: ${pos.id.slice(0, 16)}...\nPnL: +${pos.pnlPercent.toFixed(2)}%\nValue: $${pos.currentValueUsd.toFixed(2)}\nFees: $${pos.feesEarned.toFixed(4)}\n\nAuto-closing position...`,
+        );
+        const closed = await this.positionManager.closePosition(pos.id);
+        if (closed) await telegram.notifyPositionClosed(closed);
+      }
+    }
+
+    // 3. Check risk limits (loss/IL)
     const alerts = this.positionManager.checkRiskLimits();
     for (const alert of alerts) {
       logger.warn(`RISK ALERT: ${alert.reason}`);
@@ -150,23 +176,37 @@ export class DLMMAgent {
       if (closed) await telegram.notifyPositionClosed(closed);
     }
 
-    // 3. Rebalance existing positions
+    // 4. Rebalance existing positions
     const rebalResult = await this.rebalancer.runCycle();
     if (rebalResult.rebalanced > 0 || rebalResult.closed > 0) {
       logger.info(`Rebalance: ${rebalResult.rebalanced} rebalanced, ${rebalResult.closed} closed`);
     }
     this.lastRebalanceTime = Date.now();
 
-    // 4. If we have room, scan for new opportunities
+    // 5. Entry is now user-driven via /dlmm Telegram command
+    // Auto-scan disabled — user picks tokens interactively
     const currentOpen = this.positionManager.getOpenPositions().length;
-    if (currentOpen < STRATEGY_CONFIG.MAX_POSITIONS) {
-      await this.scanAndEnter(STRATEGY_CONFIG.MAX_POSITIONS - currentOpen);
+    if (currentOpen === 0) {
+      logger.info('No open positions. Use /dlmm in Telegram to scan & enter.');
     }
 
-    // 5. Persist positions
+    // 6. Background volume scanner — auto-alert high volume tokens
+    try {
+      const scanned = await scanHighVolume();
+      for (const t of scanned.slice(0, 3)) {
+        if (shouldAlert(t.mint)) {
+          markAlerted(t.mint);
+          await telegram.sendAlert(formatTokenAlert(t));
+        }
+      }
+    } catch (error) {
+      logger.debug(`Volume scan error: ${error}`);
+    }
+
+    // 7. Persist positions
     db.savePositions(this.positionManager.getAllPositions());
 
-    // 6. Print status
+    // 8. Print status
     this.printStatus();
   }
 
@@ -185,17 +225,24 @@ export class DLMMAgent {
       for (const candidate of candidates) {
         if (maxNew <= 0) break;
 
-        // Skip if we already have a position in this pool
+        // Skip if we already have an OPEN position in this pool
         const existing = this.positionManager.getOpenPositions()
           .find(p => p.poolAddress === candidate.poolAddress);
         if (existing) continue;
+
+        // Check re-entry limit per token (max 3x entry for same token)
+        const entryCount = this.tokenEntryCount.get(candidate.mintAddress) || 0;
+        if (entryCount >= STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN) {
+          logger.info(`Skipping ${candidate.symbol}: max re-entries reached (${entryCount}/${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN})`);
+          continue;
+        }
 
         // Analyze pool
         const analysis = await this.poolReader.analyzePool(candidate.poolAddress);
         if (!analysis) continue;
 
-        // Open position
-        const positionSize = POSITION_CONFIG.POSITION_SIZE;
+        // All-in: use full capital for single position
+        const positionSize = STRATEGY_CONFIG.STARTING_CAPITAL;
         const position = await this.positionManager.openPosition(
           candidate.poolAddress,
           positionSize,
@@ -205,8 +252,13 @@ export class DLMMAgent {
 
         if (position) {
           maxNew--;
+          // Track entry count for this token
+          this.tokenEntryCount.set(candidate.mintAddress, entryCount + 1);
           await telegram.notifyPositionOpened(position);
-          logger.info(`Entered: $${positionSize} in ${candidate.poolAddress.slice(0, 8)}... (score: ${candidate.score})`);
+          await telegram.sendAlert(
+            `📊 <b>ALL-IN Entry #${entryCount + 1}/${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN}</b>\nToken: ${candidate.symbol}\nCapital: $${positionSize}\nScore: ${candidate.score}\nVolume 24h: $${candidate.volume24h.toLocaleString()}`,
+          );
+          logger.info(`ALL-IN entry #${entryCount + 1}: $${positionSize} in ${candidate.symbol} (${candidate.poolAddress.slice(0, 8)}...) score: ${candidate.score}`);
         }
       }
     } catch (error) {
@@ -254,11 +306,88 @@ export class DLMMAgent {
   }
 
   /**
+   * Scan candidates for Telegram interactive selection.
+   * Returns top 5 scored candidates.
+   */
+  async scanCandidatesForTelegram(): Promise<DiscoveredCandidate[]> {
+    logger.info('[Telegram] Scanning candidates for user selection...');
+    try {
+      const candidates = await this.discovery.discoverCandidates(5);
+
+      // Filter out tokens that already hit max re-entry
+      const filtered = candidates.filter(c => {
+        const entryCount = this.tokenEntryCount.get(c.mintAddress) || 0;
+        return entryCount < STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN;
+      });
+
+      logger.info(`[Telegram] Returning ${filtered.length} candidates for selection`);
+      return filtered;
+    } catch (error) {
+      logger.error(`[Telegram] Scan failed: ${error}`);
+      return [];
+    }
+  }
+
+  /**
+   * Enter a position from Telegram user selection.
+   */
+  async enterFromTelegram(poolAddress: string, mintAddress: string, symbol: string): Promise<boolean> {
+    logger.info(`[Telegram] User selected entry: ${symbol} (${poolAddress})`);
+
+    // Check if we have room
+    const openPositions = this.positionManager.getOpenPositions();
+    if (openPositions.length >= STRATEGY_CONFIG.MAX_POSITIONS) {
+      logger.warn('[Telegram] Max positions reached');
+      return false;
+    }
+
+    // Check re-entry limit
+    const entryCount = this.tokenEntryCount.get(mintAddress) || 0;
+    if (entryCount >= STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN) {
+      logger.warn(`[Telegram] Max re-entries reached for ${symbol}`);
+      return false;
+    }
+
+    try {
+      // Analyze pool
+      const analysis = await this.poolReader.analyzePool(poolAddress);
+      if (!analysis) {
+        logger.error(`[Telegram] Pool analysis failed for ${poolAddress}`);
+        return false;
+      }
+
+      // All-in entry
+      const positionSize = STRATEGY_CONFIG.STARTING_CAPITAL;
+      const position = await this.positionManager.openPosition(
+        poolAddress,
+        positionSize,
+        analysis.suggestedRange.min,
+        analysis.suggestedRange.max,
+      );
+
+      if (position) {
+        this.tokenEntryCount.set(mintAddress, entryCount + 1);
+        await telegram.notifyPositionOpened(position);
+        logger.info(`[Telegram] Entry #${entryCount + 1}: $${positionSize} in ${symbol}`);
+        // Persist immediately
+        db.savePositions(this.positionManager.getAllPositions());
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      logger.error(`[Telegram] Entry failed: ${error}`);
+      return false;
+    }
+  }
+
+  /**
    * Stop the agent gracefully
    */
   stop(): void {
     logger.info('Stopping agent...');
     this.running = false;
+    stopCommandPolling();
   }
 
   private sleep(ms: number): Promise<void> {

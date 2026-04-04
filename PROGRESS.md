@@ -2,31 +2,61 @@
 
 **Project**: Automated LP Agent for Meteora DLMM on Solana
 **Start Date**: March 31, 2026
-**Last Updated**: March 31, 2026
-**Status**: 🟡 **IN PROGRESS** - Phase C Complete, Ready for Phase B
+**Last Updated**: April 4, 2026
+**Status**: 🟡 **IN PROGRESS** - Interactive Telegram Flow + All-In Strategy
 
 ---
 
-## 📊 Overall Progress: 40% Complete
+## 📊 Overall Progress: 65% Complete
 
 ```
-[████████████░░░░░░░░░░░░░░░░] 40%
+[██████████████████░░░░░░░░░░] 65%
 
 ✅ Phase A: PoC (100%)
 ✅ Phase C: Token Scanner (100%)
+✅ Phase D: Telegram Interactive (100%)
+✅ Phase E: All-In Strategy (100%)
 ⏳ Phase B: Foundation (0%)
 ⏳ Production Deployment (0%)
 ```
 
 ---
 
+## 🔄 Session Update — April 4, 2026
+
+### Changes Made:
+1. **All-In Strategy** — Capital $150, 1 position max, target +10% auto-exit
+2. **Max re-entry 3x** per token, tracking per mint address
+3. **Telegram Command Handler** — Bot now responds to commands
+4. **Interactive /dlmm flow** — Scan → show 3 candidates with inline buttons → user picks → bot enters
+5. **Pool Discovery rewrite** — On-chain DLMM pool validation, memecoin focused search, pump.fun/DexScreener multi-source
+6. **User-driven entry** — Auto-scan disabled, user picks tokens via /dlmm
+7. **/status** with "Scan Tokens" quick-action button
+8. **Volume filter** expanded to $50M max (memecoins have huge volume)
+9. **Min token age** lowered to 1 day
+
+### Telegram Commands:
+- `/dlmm` — Scan tokens, show candidates, pick to enter
+- `/status` — Show agent status & positions
+- `/help` — Show help
+
+### Config (.env):
+- STARTING_CAPITAL=150
+- MAX_POSITIONS=1
+- PROFIT_TARGET_PERCENT=10
+- MAX_REENTRY_PER_TOKEN=3
+- MIN_TOKEN_AGE_DAYS=1
+- MAX_DAILY_VOLUME=50000000
+
+---
+
 ## 🎯 Project Goals
 
-**Capital**: Under $100 USD
-**Strategy**: Quick flip LP on new token launches (3-7 days old)
-**Target**: 20% daily gain from multiple tokens
+**Capital**: $150 USD (all-in single token)
+**Strategy**: Memecoin LP on high-volume tokens, user-selected via Telegram
+**Target**: +10% per position, auto-exit on hit
 **Risk**: Max 10% loss per position, Max 10% IL auto-exit
-**Rebalancing**: 6-12x daily (semi-aggressive)
+**Re-entry**: Max 3x per token
 
 **Pair Selection**:
 - ✅ High volume memecoins (SOL-TROLL, etc.)

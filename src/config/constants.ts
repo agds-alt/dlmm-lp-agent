@@ -28,27 +28,29 @@ export const WALLET_CONFIG = {
 
 // Strategy Parameters
 export const STRATEGY_CONFIG = {
-  STARTING_CAPITAL: parseFloat(process.env.STARTING_CAPITAL || '50'),
-  MAX_POSITIONS: parseInt(process.env.MAX_POSITIONS || '3'),
+  STARTING_CAPITAL: parseFloat(process.env.STARTING_CAPITAL || '150'),
+  MAX_POSITIONS: parseInt(process.env.MAX_POSITIONS || '1'),
   TARGET_DAILY_GAIN: parseFloat(process.env.TARGET_DAILY_GAIN || '20'),
   MAX_LOSS_PERCENT: parseFloat(process.env.MAX_LOSS_PERCENT || '10'),
   MAX_IL_PERCENT: parseFloat(process.env.MAX_IL_PERCENT || '10'),
   REBALANCE_FREQUENCY: parseInt(process.env.REBALANCE_FREQUENCY || '6'),
+  MAX_REENTRY_PER_TOKEN: parseInt(process.env.MAX_REENTRY_PER_TOKEN || '3'),
+  PROFIT_TARGET_PERCENT: parseFloat(process.env.PROFIT_TARGET_PERCENT || '10'),
 };
 
 // Calculate position sizing
 export const POSITION_CONFIG = {
   POSITION_SIZE: STRATEGY_CONFIG.STARTING_CAPITAL / STRATEGY_CONFIG.MAX_POSITIONS,
-  RESERVE_AMOUNT: STRATEGY_CONFIG.STARTING_CAPITAL * 0.1, // 10% reserve
-  ACTIVE_CAPITAL: STRATEGY_CONFIG.STARTING_CAPITAL * 0.9, // 90% active
+  RESERVE_AMOUNT: STRATEGY_CONFIG.STARTING_CAPITAL * 0.05, // 5% reserve (smaller for all-in)
+  ACTIVE_CAPITAL: STRATEGY_CONFIG.STARTING_CAPITAL * 0.95, // 95% active
 };
 
 // Token Filter Configuration
 export const TOKEN_FILTERS = {
-  MIN_TOKEN_AGE_DAYS: parseInt(process.env.MIN_TOKEN_AGE_DAYS || '3'),
+  MIN_TOKEN_AGE_DAYS: parseInt(process.env.MIN_TOKEN_AGE_DAYS || '1'),
   MAX_TOKEN_AGE_DAYS: parseInt(process.env.MAX_TOKEN_AGE_DAYS || '30'),
   MIN_DAILY_VOLUME: parseFloat(process.env.MIN_DAILY_VOLUME || '50000'),
-  MAX_DAILY_VOLUME: parseFloat(process.env.MAX_DAILY_VOLUME || '500000'),
+  MAX_DAILY_VOLUME: parseFloat(process.env.MAX_DAILY_VOLUME || '50000000'),
   MIN_LIQUIDITY: parseFloat(process.env.MIN_LIQUIDITY || '10000'),
   MAX_TOP_HOLDER_PERCENT: 20, // 20% max for single holder
   MIN_UNIQUE_TRADERS: 100,

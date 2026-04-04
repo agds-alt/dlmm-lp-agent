@@ -1,18 +1,25 @@
 /**
  * Pool Discovery
  *
- * Auto-discovers new DLMM pool candidates by fetching trending Solana tokens
- * from DexScreener, filtering by age/volume, and scoring them with the
- * existing TokenScanner pipeline.
+ * Discovers Solana memecoin candidates with VALID Meteora DLMM pools.
+ *
+ * Flow:
+ * 1. Fetch trending/boosted Solana memecoins from DexScreener
+ * 2. For each token, find its Meteora DLMM pool (on-chain validation)
+ * 3. Filter by age, volume, liquidity
+ * 4. Score via TokenScanner safety checks
+ * 5. Return validated candidates only
  */
 
-import { Connection } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
+import DLMM from '@meteora-ag/dlmm';
 import axios from 'axios';
 import { logger } from '../utils/logger';
-import { TOKEN_FILTERS, DLMM_CONFIG } from '../config/constants';
+import { TOKEN_FILTERS } from '../config/constants';
 import { TokenScanner, TokenCandidate } from './token.scanner';
 
 const DEXSCREENER_API = 'https://api.dexscreener.com';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /** Raw pair record returned by DexScreener. */
 interface DexScreenerPair {
@@ -55,16 +62,13 @@ export interface DiscoveredCandidate {
   candidate: TokenCandidate | null;
 }
 
-/**
- * In-memory cache entry to avoid re-scanning the same mint within a cooldown
- * window.
- */
+/** In-memory cache entry. */
 interface CacheEntry {
   result: DiscoveredCandidate;
   expiresAt: number;
 }
 
-const DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 export class PoolDiscovery {
   private connection: Connection;
@@ -79,117 +83,179 @@ export class PoolDiscovery {
   }
 
   /**
-   * Discover top DLMM pool candidates from DexScreener trending tokens.
+   * Discover top DLMM pool candidates — memecoin focused.
    *
-   * Flow:
-   * 1. Fetch trending Solana pairs from DexScreener.
-   * 2. Filter by age, volume, and whether the pair is on Meteora DLMM.
-   * 3. Score each token via the existing TokenScanner (Tier 1-2).
-   * 4. Return the top `limit` candidates sorted by score.
+   * Only returns tokens that have a VERIFIED Meteora DLMM pool on-chain.
    */
-  async discoverCandidates(limit: number = 5): Promise<DiscoveredCandidate[]> {
-    logger.info(`[PoolDiscovery] Starting candidate discovery (limit=${limit})`);
+  async discoverCandidates(limit: number = 3): Promise<DiscoveredCandidate[]> {
+    logger.info(`[PoolDiscovery] Starting memecoin discovery (limit=${limit})`);
 
-    // Step 1: Fetch trending pairs
-    const pairs = await this.fetchTrendingPairs();
+    // Step 1: Fetch trending Solana memecoin pairs
+    const pairs = await this.fetchMemecoins();
     if (pairs.length === 0) {
-      logger.warn('[PoolDiscovery] No trending pairs returned from DexScreener');
+      logger.warn('[PoolDiscovery] No memecoin pairs found');
       return [];
     }
-    logger.info(`[PoolDiscovery] Fetched ${pairs.length} trending Solana pairs`);
+    logger.info(`[PoolDiscovery] Fetched ${pairs.length} memecoin pairs from DexScreener`);
 
-    // Step 2: Filter
+    // Step 2: Filter by age, volume, liquidity
     const filtered = this.filterPairs(pairs);
-    logger.info(`[PoolDiscovery] ${filtered.length} pairs passed filters`);
+    logger.info(`[PoolDiscovery] ${filtered.length} pairs passed basic filters`);
 
-    if (filtered.length === 0) {
-      return [];
-    }
+    if (filtered.length === 0) return [];
 
-    // Step 3: Score each candidate (with cache)
-    const scored: DiscoveredCandidate[] = [];
-
+    // Step 3: Deduplicate by base token (keep highest volume pair per token)
+    const byToken = new Map<string, DexScreenerPair>();
     for (const pair of filtered) {
+      const mint = pair.baseToken.address;
+      const existing = byToken.get(mint);
+      if (!existing || (pair.volume?.h24 ?? 0) > (existing.volume?.h24 ?? 0)) {
+        byToken.set(mint, pair);
+      }
+    }
+    const uniqueTokens = Array.from(byToken.values());
+    logger.info(`[PoolDiscovery] ${uniqueTokens.length} unique tokens after dedup`);
+
+    // Step 4: For each token, find & validate Meteora DLMM pool on-chain
+    const validated: DiscoveredCandidate[] = [];
+
+    for (const pair of uniqueTokens) {
+      if (validated.length >= limit * 2) break; // Get enough to score
+
       const cached = this.getFromCache(pair.baseToken.address);
       if (cached) {
-        logger.debug(`[PoolDiscovery] Cache hit for ${pair.baseToken.symbol}`);
-        scored.push(cached);
+        validated.push(cached);
         continue;
       }
 
-      const discovered = await this.scorePair(pair);
-      if (discovered) {
-        this.addToCache(discovered);
-        scored.push(discovered);
+      const candidate = await this.validateAndScore(pair);
+      if (candidate) {
+        this.addToCache(candidate);
+        validated.push(candidate);
+        logger.info(`[PoolDiscovery] ✅ ${candidate.symbol}: DLMM pool valid, score=${candidate.score}`);
       }
     }
 
-    // Step 4: Sort by score desc, take top N
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, limit);
+    // Step 5: Sort by score desc, take top N
+    validated.sort((a, b) => b.score - a.score);
+    const top = validated.slice(0, limit);
 
     logger.info(
-      `[PoolDiscovery] Returning top ${top.length} candidates: ` +
-        top.map(c => `${c.symbol}(${c.score})`).join(', '),
+      `[PoolDiscovery] Returning ${top.length} validated candidates: ` +
+        top.map(c => `${c.symbol}(score:${c.score}, vol:$${(c.volume24h / 1000).toFixed(0)}K)`).join(', '),
     );
 
     return top;
   }
 
-  // ─── Internal helpers ───────────────────────────────────────────
+  // ─── Fetching ──────────────────────────────────────────────────
 
   /**
-   * Fetch trending Solana token pairs from DexScreener.
-   * Falls back to the search/boosted endpoint when the token-boosts
-   * endpoint is empty.
+   * Fetch Solana memecoins from multiple DexScreener sources.
+   * Specifically targets Meteora DLMM pairs first, then broadens.
    */
-  private async fetchTrendingPairs(): Promise<DexScreenerPair[]> {
-    try {
-      // Search for Meteora pairs directly - these have volume/age data
-      const keywords = ['meteora', 'SOL meme', 'solana new'];
-      let allPairs: DexScreenerPair[] = [];
+  private async fetchMemecoins(): Promise<DexScreenerPair[]> {
+    let allPairs: DexScreenerPair[] = [];
 
-      for (const q of keywords) {
+    // Strategy 1: Direct search for Meteora DLMM memecoins
+    const meteoraQueries = [
+      'meteora dlmm meme',
+      'meteora dlmm SOL',
+      'meteora memecoin',
+    ];
+
+    for (const q of meteoraQueries) {
+      try {
+        const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
+          `${DEXSCREENER_API}/latest/dex/search`,
+          { params: { q }, timeout: 15_000 },
+        );
+        const pairs = (resp.data?.pairs ?? []).filter(
+          (p: DexScreenerPair) =>
+            p.chainId === 'solana' &&
+            p.dexId?.toLowerCase().includes('meteora'),
+        );
+        allPairs.push(...pairs);
+      } catch {
+        // continue
+      }
+    }
+
+    logger.info(`[PoolDiscovery] Meteora-specific search: ${allPairs.length} pairs`);
+
+    // Strategy 2: Boosted/trending tokens — then check if they have Meteora pools
+    try {
+      const resp = await axios.get(`${DEXSCREENER_API}/token-boosts/top/v1`, {
+        timeout: 15_000,
+      });
+      const boosts = resp.data ?? [];
+      const solanaMints: string[] = boosts
+        .filter((b: any) => b.chainId === 'solana')
+        .map((b: any) => b.tokenAddress)
+        .slice(0, 30);
+
+      // Fetch all pairs for these tokens, we'll find Meteora ones later
+      for (let i = 0; i < solanaMints.length; i += 5) {
+        const batch = solanaMints.slice(i, i + 5).join(',');
         try {
-          const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
-            `${DEXSCREENER_API}/latest/dex/search`,
-            { params: { q }, timeout: 15_000 },
+          const pairResp = await axios.get(
+            `${DEXSCREENER_API}/tokens/v1/solana/${batch}`,
+            { timeout: 15_000 },
           );
-          const pairs = (resp.data?.pairs ?? []).filter(
-            (p: DexScreenerPair) => p.chainId === 'solana' && p.dexId?.includes('meteora'),
+          const data = Array.isArray(pairResp.data) ? pairResp.data : (pairResp.data?.pairs ?? []);
+          const solanaPairs = data.filter(
+            (p: DexScreenerPair) => p.chainId === 'solana',
           );
-          allPairs.push(...pairs);
+          allPairs.push(...solanaPairs);
         } catch {
-          // Skip failed queries
+          // skip
         }
       }
-
-      // Deduplicate by pairAddress
-      const seen = new Set<string>();
-      allPairs = allPairs.filter(p => {
-        if (seen.has(p.pairAddress)) return false;
-        seen.add(p.pairAddress);
-        return true;
-      });
-
-      return allPairs;
-    } catch (error) {
-      logger.error('[PoolDiscovery] Failed to fetch trending pairs', error);
-      return [];
+    } catch {
+      logger.debug('[PoolDiscovery] Boosted endpoint failed');
     }
+
+    // Strategy 3: General memecoin search
+    const memeQueries = ['solana meme new', 'SOL memecoin trending', 'pump.fun meme'];
+    for (const q of memeQueries) {
+      try {
+        const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
+          `${DEXSCREENER_API}/latest/dex/search`,
+          { params: { q }, timeout: 15_000 },
+        );
+        const pairs = (resp.data?.pairs ?? []).filter(
+          (p: DexScreenerPair) => p.chainId === 'solana',
+        );
+        allPairs.push(...pairs);
+      } catch {
+        // continue
+      }
+    }
+
+    // Deduplicate by pairAddress
+    const seen = new Set<string>();
+    allPairs = allPairs.filter(p => {
+      if (seen.has(p.pairAddress)) return false;
+      seen.add(p.pairAddress);
+      return true;
+    });
+
+    // Sort by 24h volume desc
+    allPairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0));
+
+    logger.info(`[PoolDiscovery] Total unique pairs: ${allPairs.length}`);
+    return allPairs;
   }
 
-  /**
-   * Apply age, volume, and DLMM-presence filters.
-   */
+  // ─── Filtering ─────────────────────────────────────────────────
+
   private filterPairs(pairs: DexScreenerPair[]): DexScreenerPair[] {
     const now = Date.now();
 
     return pairs.filter(pair => {
-      // Must have creation timestamp
       if (!pair.pairCreatedAt) return false;
 
-      // Age filter
+      // Age filter (min 1 day default)
       const ageDays = (now - pair.pairCreatedAt) / (24 * 60 * 60 * 1000);
       if (ageDays < TOKEN_FILTERS.MIN_TOKEN_AGE_DAYS) return false;
       if (ageDays > TOKEN_FILTERS.MAX_TOKEN_AGE_DAYS) return false;
@@ -203,20 +269,49 @@ export class PoolDiscovery {
       const liq = pair.liquidity?.usd ?? 0;
       if (liq < TOKEN_FILTERS.MIN_LIQUIDITY) return false;
 
-      // Prefer Meteora DLMM pairs, but also accept other Solana DEXes
-      // (users can check for a DLMM pool on-chain before opening a position)
+      // Must be paired with SOL or USDC (not random token pairs)
+      const quote = pair.quoteToken?.address ?? '';
+      const isSolPair = quote === SOL_MINT || pair.quoteToken?.symbol === 'SOL';
+      const isUsdcPair = pair.quoteToken?.symbol === 'USDC' || pair.quoteToken?.symbol === 'USDT';
+      if (!isSolPair && !isUsdcPair) return false;
+
       return true;
     });
   }
 
+  // ─── Validation & Scoring ──────────────────────────────────────
+
   /**
-   * Score a single DexScreener pair by running it through the TokenScanner.
+   * For a given DexScreener pair, find its Meteora DLMM pool on-chain
+   * and run safety scoring.
    */
-  private async scorePair(pair: DexScreenerPair): Promise<DiscoveredCandidate | null> {
+  private async validateAndScore(pair: DexScreenerPair): Promise<DiscoveredCandidate | null> {
     const mintAddress = pair.baseToken.address;
     const now = Date.now();
     const ageDays = (now - pair.pairCreatedAt) / (24 * 60 * 60 * 1000);
 
+    // First: try using the DexScreener pairAddress directly if it's a Meteora pair
+    let validPoolAddress: string | null = null;
+
+    if (pair.dexId?.toLowerCase().includes('meteora')) {
+      // Validate on-chain that this is actually a DLMM pool
+      const isValid = await this.validateDlmmPool(pair.pairAddress);
+      if (isValid) {
+        validPoolAddress = pair.pairAddress;
+      }
+    }
+
+    // If not Meteora or validation failed, search for a DLMM pool for this token
+    if (!validPoolAddress) {
+      validPoolAddress = await this.findDlmmPoolForToken(mintAddress);
+    }
+
+    if (!validPoolAddress) {
+      logger.debug(`[PoolDiscovery] ❌ No valid DLMM pool for ${pair.baseToken.symbol} (${mintAddress.slice(0, 8)}...)`);
+      return null;
+    }
+
+    // Score via safety checker
     try {
       const candidate = await this.tokenScanner.scanToken(mintAddress, {
         includeTier2: true,
@@ -224,12 +319,12 @@ export class PoolDiscovery {
         includeTier4: false,
       });
 
-      const discovered: DiscoveredCandidate = {
+      return {
         mintAddress,
         symbol: pair.baseToken.symbol,
         name: pair.baseToken.name,
-        poolAddress: pair.pairAddress,
-        dexId: pair.dexId,
+        poolAddress: validPoolAddress,
+        dexId: 'meteora_dlmm',
         volume24h: pair.volume?.h24 ?? 0,
         liquidity: pair.liquidity?.usd ?? 0,
         ageDays,
@@ -238,15 +333,68 @@ export class PoolDiscovery {
         score: candidate?.score ?? -1,
         candidate,
       };
-
-      return discovered;
     } catch (error) {
-      logger.error(`[PoolDiscovery] Failed to score ${mintAddress}`, error);
+      logger.error(`[PoolDiscovery] Scoring failed for ${mintAddress}: ${error}`);
       return null;
     }
   }
 
-  // ─── Cache management ───────────────────────────────────────────
+  /**
+   * Validate that a pool address is actually a Meteora DLMM pool.
+   */
+  private async validateDlmmPool(poolAddress: string): Promise<boolean> {
+    try {
+      const dlmmPool = await DLMM.create(this.connection, new PublicKey(poolAddress));
+      // If we can get active bin, it's a valid DLMM pool
+      await dlmmPool.getActiveBin();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Search for a Meteora DLMM pool for a given token mint.
+   * Tries token/SOL pair first (most common for memecoins).
+   */
+  private async findDlmmPoolForToken(tokenMint: string): Promise<string | null> {
+    try {
+      // Get all DLMM pairs and find ones that match this token
+      const allPairs = await DLMM.getLbPairs(this.connection);
+
+      const matching = allPairs.filter(p => {
+        const xMint = p.account.tokenXMint.toBase58();
+        const yMint = p.account.tokenYMint.toBase58();
+        return (
+          (xMint === tokenMint && yMint === SOL_MINT) ||
+          (xMint === SOL_MINT && yMint === tokenMint) ||
+          xMint === tokenMint ||
+          yMint === tokenMint
+        );
+      });
+
+      if (matching.length === 0) return null;
+
+      // Prefer SOL pairs, validate the first match
+      const solPair = matching.find(p => {
+        const xMint = p.account.tokenXMint.toBase58();
+        const yMint = p.account.tokenYMint.toBase58();
+        return xMint === SOL_MINT || yMint === SOL_MINT;
+      });
+
+      const bestMatch = solPair || matching[0];
+      const poolAddr = bestMatch.publicKey.toBase58();
+
+      // Validate it works
+      const valid = await this.validateDlmmPool(poolAddr);
+      return valid ? poolAddr : null;
+    } catch (error) {
+      logger.debug(`[PoolDiscovery] DLMM pool search failed for ${tokenMint.slice(0, 8)}...: ${error}`);
+      return null;
+    }
+  }
+
+  // ─── Cache management ──────────────────────────────────────────
 
   private getFromCache(mintAddress: string): DiscoveredCandidate | null {
     const entry = this.cache.get(mintAddress);
@@ -265,9 +413,6 @@ export class PoolDiscovery {
     });
   }
 
-  /**
-   * Evict expired cache entries. Call periodically if running long-lived.
-   */
   pruneCache(): number {
     const now = Date.now();
     let pruned = 0;
